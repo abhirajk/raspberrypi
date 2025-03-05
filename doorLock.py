@@ -15,8 +15,8 @@ class MotorControl:
         self.inputB = machine.Pin(inputBPin, machine.Pin.OUT);
         self.inputB.off()
         self.speedControl = machine.PWM(machine.Pin(enablePin))
-        self.speedControl.freq(50)
         self.speedControl.duty_u16(0)
+        self.speedControl.freq(50)
 
     def rotate(self, speed, direction):
         if speed > 100: speed=100
@@ -32,6 +32,11 @@ class MotorControl:
         if direction > 0:
             self.inputA.value(1)
             self.inputB.value(0)
+
+    def reset(self):
+        self.inputA.value(0)
+        self.inputB.value(0)
+        self.speedControl.duty_u16(0)
 
 #Position
 class DoorPosition:
@@ -105,21 +110,18 @@ class DoorPosition:
             self.closeBoundary = [closeRangeB, closeRangeA]
         else:
             self.closeBoundary = [closeRangeA, closeRangeB]
-        
-        
+        return True
 
-
-MOTOR_INPUT_1_PIN=14 
-MOTOR_INPUT_2_PIN=15
-MOTOR_ENABLE_1_2_PIN=16
-motorControl = MotorControl(MOTOR_INPUT_1_PIN, MOTOR_INPUT_2_PIN, MOTOR_ENABLE_1_2_PIN)
-
-POSITION_ENABLE_PIN = 17
-POSITION_MEASURE_PIN = 26
-doorPosition = DoorPosition(POSITION_ENABLE_PIN, POSITION_MEASURE_PIN)
+    def reset(self):
+        self.enable.off()
 
 #Alert
-class DoorAlert:
+class DoorAlerter:
+    BUZZER_FREQ = 1047
+    BUZZER_DUTY = 2000
+    BUZZER_DURATION_IN_MS = 300
+    NOTIFY_LED_ON_DURATION_IN_MS = 200
+    NOTIFY_LED_OFF_DURATION_IN_MS = 200
     openLed = None
     closeLed = None
     buzzer = None
@@ -131,111 +133,166 @@ class DoorAlert:
         self.closeLed.off()
         self.buzzer = machine.PWM(machine.Pin(buzzerPin));
         
-    def __blink(self, led, repeat=1, onTime=0.3, offTime=0.15, buzz=False):
+    def __blink(self, led, repeat=1, onTime=300, offTime=150, buzz=False):
         if buzz:
             self.buzzer.freq(1047)
         while repeat>0:
             if buzz:
                 self.buzzer.duty_u16(2000)
             led.on()
-            time.sleep(onTime)
+            time.sleep(onTime / 1000)
             led.off()
             if buzz:
                 self.buzzer.duty_u16(0)
             repeat -= 1
             if repeat > 0:
-                time.sleep(offTime)
-        
-    def ackOpen(self):
-        self.__blink(self.openLed, buzz=True)
+                time.sleep(offTime / 1000)
 
-    def ackClose(self):
+    def notifyCloseDoor(self):
         self.__blink(self.closeLed, buzz=True)
         
-    def doorOpen(self):
+    def notifyOpenDoor(self):
         self.__blink(self.openLed, buzz=True)
         
-    def shutdown(self):
-        self.__blink(self.closeLed, repeat=3, onTime=0.2, offTime=0.2, buzz=False)
-    
+    def notifyShutdown(self):
+        self.__blink(self.closeLed, repeat=3, onTime=self.NOTIFY_LED_ON_DURATION_IN_MS, offTime=self.NOTIFY_LED_OFF_DURATION_IN_MS, buzz=False)
+
+    def notifyError(self):
+        self.__blink(self.closeLed, repeat=3, onTime=self.NOTIFY_LED_ON_DURATION_IN_MS, offTime=self.NOTIFY_LED_OFF_DURATION_IN_MS, buzz=False)
+        
     def buzz(self):
-        self.buzzer.freq(1047)
-        self.buzzer.duty_u16(2000)
-        time.sleep(0.3)
+        self.buzzer.freq(self.BUZZER_FREQ)
+        self.buzzer.duty_u16(self.BUZZER_DUTY)
+        time.sleep(BUZZER_DURATION_IN_MS / 1000)
         self.buzzer.duty_u16(0)
 
+    def reset(self):
+        self.buzzer.duty_u16(0)
+        self.openLed.off()
+        self.closeLed.off()
+        
+#Controller
+class DoorController:
+    INPUT_HOLD_SHUTDOWN_IN_MS = 3000
+    CHECK_INPUT_SHUTDOWN_IN_MS = 500
+    SLEEP_PERIOD_IN_MS = 500
+    CHECK_INTERVAL_IN_MS = 2000
+    CHECK_INPUT_SET_POSITION_IN_MS = 200
+    pinConfig = None
+    motorControl = None
+    position = None
+    alerter = None
+    inputButton = None
 
-BUZZER_PIN = 18
-CLOSE_LED_PIN = 19
-OPEN_LED_PIN = 20
-alert = DoorAlert(OPEN_LED_PIN, CLOSE_LED_PIN, BUZZER_PIN)
+    def __init__(self, pinConfig):
+        self.pinConfig = pinConfig
+        self.motorControl = MotorControl(pinConfig["motor"]["input"]["a"], pinConfig["motor"]["input"]["b"], pinConfig["motor"]["enable"])
+        self.position = DoorPosition(pinConfig["position"]["enable"], pinConfig["position"]["measure"])
+        self.alerter = DoorAlerter(pinConfig["alert"]["openLed"], pinConfig["alert"]["closeLed"], pinConfig["alert"]["buzzer"])
+        self.inputButton = machine.Pin(pinConfig["inputButton"], machine.Pin.IN, machine.Pin.PULL_UP)        
+    
+    def __isShutdownSequence(self):
+        shutdownHold = 0
+        #If input is pressed during startup then prepare to shutdown if held down for MAX_CYCLE_FOR_SHUTDOWN * CHECK_INPUT_SLEEP_FOR_SHUTDOWN_IN_SEC
+        if self.inputButton.value() == 0:#Pressed
+            while True:
+                if self.inputButton.value() == 1:#Released
+                    return False
+                self.alerter.buzz()
+                time.sleep(self.CHECK_INPUT_SHUTDOWN_IN_MS / 1000)
+                shutdownHold += CHECK_INPUT_SHUTDOWN_IN_MS
+                if shutdownWait > self.INPUT_HOLD_SHUTDOWN_IN_MS:
+                    self.alerter.notifyShutdown()
+                    return True
+        return False
 
-SET_PIN = 9
-setButton = machine.Pin(SET_PIN, machine.Pin.IN, machine.Pin.PULL_UP)
+    def __setDoorPosition(self, type: int):
+        indicator = None
+        if type==1:
+            indicator = self.alerter.openLed
+        else:
+            indicator = self.alerter.closeLed
+        indicator.on()
+        while True:
+            if self.inputButton.value() == 0:
+                break
+            time.sleep(CHECK_INPUT_SET_POSITION_IN_MS / 1000)
+            indicator.toggle()
+        indicator.off()
+        if type==1:
+            self.position.setOpenPosition()
+            self.alerter.notifyOpenDoor()
+        else:
+            self.position.setClosePosition()
+            self.alerter.notifyCloseDoor()
 
-#Setting the initial positions
-MAX_CYCLE_FOR_SHUTDOWN = 3
-shutdownCycle = 0
-if setButton.value() == 0:
-    while True:
-        if setButton.value() == 1:
-            break
-        alert.buzz()
-        time.sleep(0.5)
-        shutdownCycle += 1
-        if shutdownCycle > MAX_CYCLE_FOR_SHUTDOWN:
-            alert.shutdown()
-            sys.exit(0);
+    def setOpenDoorPosition(self):
+        __setDoorPosition(self, type=1)
 
-alert.openLed.on()
-onState = True
-while True:
-    if setButton.value() == 0:
-        doorPosition.setOpenPosition()
-        break
-    time.sleep(0.2)
-    if onState:
-        alert.openLed.off()
-        onState = False
-    else:
-        alert.openLed.on()
-        onState = True
-alert.ackOpen()
-time.sleep(0.5)
-alert.closeLed.on()
-onState = True
-while True:
-    if setButton.value() == 0:
-        doorPosition.setClosePosition()
-        break
-    time.sleep(0.2)
-    if onState:
-        alert.closeLed.off()
-        onState = False
-    else:
-        alert.closeLed.on()
-        onState = True
-alert.ackClose()
+    def setCloseDoorPosition(self):
+        __setDoorPosition(self, type=0)
 
-doorPosition.initialize()
+    def initiallize(self):
+        if __isShutdownSequence(self):
+            return False
+        while True
+            __setDoorPosition(self, type=1)#Open
+            __setDoorPosition(self, type=0)#Close
+            if self.position.initialize():
+                break
+            else
+                self.alerter.notifyError()
+        return True
 
-countSetButton = 0
-SLEEP_PERIOD_IN_MS = 500
-CHECK_INTERVAL_IN_MS = 2000
-interval = 0
-while True:
-    startTime = time.time()
-    if machine.Pin(SET_PIN, machine.Pin.IN, machine.Pin.PULL_UP).value() == 0:
-        countSetButton += 1
-        if countSetButton >= 4:
-            machine.reset()
-    else:
-        countSetButton = 0
-    if interval >= CHECK_INTERVAL_IN_MS:
+    def watch(self):
+        countButtonPressed = 0
         interval = 0
-        if doorPosition.isOpen()==True:
-            alert.doorOpen()
-        print(":", end="")
-    print(".", end="")
-    machine.lightsleep(SLEEP_PERIOD_IN_MS)
-    interval += SLEEP_PERIOD_IN_MS
+        while True:
+            inputButton = machine.Pin(self.pinConfig["inputButton"], machine.Pin.IN, machine.Pin.PULL_UP)
+            if inputButton.value() == 0:
+                countButtonPressed += 1
+                if countButtonPressed >= 4:
+                    self.reset()
+                    return
+            else:
+                countButtonPressed = 0
+            if interval >= CHECK_INTERVAL_IN_MS:
+                interval = 0
+                if self.position.isOpen()==True:
+                    self.alerter.notifyOpenDoor()
+            machine.lightsleep(SLEEP_PERIOD_IN_MS)
+            interval += SLEEP_PERIOD_IN_MS
+
+    def reset(self):
+        self.motorControl.reset()
+        self.position.reset()
+        self.alerter.reset()
+        machine.reset()
+        
+# --- Pin Mapping on Pico
+# Motor Control Pins
+pinConfig = {
+    "motor": {
+        "enable": 16,
+        "input": {
+            "a": 14, 
+            "b": 15
+        }
+    },
+    "position": {
+        "enable": 17,
+        "measure": 26
+    },
+    "alert": {
+        "openLed": 20
+        "closeLed": 19
+        "buzzer": 18
+    },
+    "inputButton": 9
+}
+
+doorController = DoorController(pinConfig)
+if not doorController.initialize():
+    sys.exit(0)
+
+doorController.watch()
